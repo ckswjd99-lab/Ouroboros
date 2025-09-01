@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
+import einops
 
 import numpy as np
 import os
@@ -43,9 +44,7 @@ from ..proc_image import (
 
 from .maskedrcnn_vit_fpn import MaskedRCNN_ViT_FPN_Contexted
 
-fidx = 0
-
-class MaskedRCNN_ViT_B_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
+class MaskedRCNN_ViT_H_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
     def __init__(self, device="cuda"):
         super().__init__()
         self.idx = 0
@@ -78,10 +77,9 @@ class MaskedRCNN_ViT_B_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
             imagenet_rgb256_std=[58.395, 57.12, 57.375],
         )
 
-        self.embed_dim, depth, num_heads, dp = 768, 12, 12, 0.1
+        self.embed_dim, depth, num_heads, dp = 1280, 32, 16, 0.5
+        self.window_block_indexes = list(range(0, 7)) + list(range(8, 15)) + list(range(16, 23)) + list(range(24, 31))
         num_classes = 80
-
-        self.window_block_indexes = [0, 1, 3, 4, 6, 7, 9, 10]
 
         # backbone
         self.backbone = SimpleFeaturePyramid(
@@ -176,7 +174,7 @@ class MaskedRCNN_ViT_B_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
             input_format="RGB",
         ).to(self.device)
     
-    def load_weight(self, weight_pkl_path='./model_final_61ccd1.pkl'):
+    def load_weight(self, weight_pkl_path='./model_final_7224f1.pkl'):
         with open(weight_pkl_path, 'rb') as f:
             weights = pickle.load(f)['model']
 
@@ -185,57 +183,3 @@ class MaskedRCNN_ViT_B_FPN_Contexted(MaskedRCNN_ViT_FPN_Contexted):
                 param.data.copy_(torch.tensor(weights[name]))
             else:
                 print(f"Parameter {name} not found in weights")
-
-def reset_head(base_model, num_classes=30, device="cuda"):
-    """
-    base_model: GeneralizedRCNN 인스턴스
-    num_classes: 새로운 클래스 개수
-    device: 장치
-    """
-
-    # 새 roi_heads 생성 (초기화와 동일하게)
-    roi_heads = StandardROIHeads(
-        num_classes=num_classes,
-        batch_size_per_image=512,
-        positive_fraction=0.25,
-        proposal_matcher=Matcher(
-            thresholds=[0.5], labels=[0, 1], allow_low_quality_matches=False
-        ),
-        box_in_features=["p2", "p3", "p4", "p5"],
-        box_pooler=ROIPooler(
-            output_size=7,
-            scales=(1.0 / 4, 1.0 / 8, 1.0 / 16, 1.0 / 32),
-            sampling_ratio=0,
-            pooler_type="ROIAlignV2",
-        ),
-        box_head=FastRCNNConvFCHead(
-            input_shape=ShapeSpec(channels=256, height=7, width=7),
-            conv_dims=[256, 256, 256, 256],
-            fc_dims=[1024],
-            conv_norm="LN"
-        ),
-        box_predictor=FastRCNNOutputLayers(
-            input_shape=ShapeSpec(channels=1024),
-            test_score_thresh=0.05,
-            box2box_transform=Box2BoxTransform(weights=(10, 10, 5, 5)),
-            num_classes=num_classes,
-        ),
-        mask_in_features=["p2", "p3", "p4", "p5"],
-        mask_pooler=ROIPooler(
-            output_size=14,
-            scales=(1.0 / 4, 1.0 / 8, 1.0 / 16, 1.0 / 32),
-            sampling_ratio=0,
-            pooler_type="ROIAlignV2",
-        ),
-        mask_head=MaskRCNNConvUpsampleHead(
-            input_shape=ShapeSpec(channels=256, width=14, height=14),
-            num_classes=num_classes+1,
-            conv_dims=[256, 256, 256, 256, 256],
-            conv_norm="LN",
-        ),
-    ).to(device)
-
-    roi_heads.mask_on = False
-    
-    base_model.roi_heads = roi_heads
-

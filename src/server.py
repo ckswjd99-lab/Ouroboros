@@ -13,8 +13,12 @@ import socket
 import time
 import av
 import os
+import torch
 from multiprocessing import Process, Queue
 
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+torch.cuda.empty_cache()
+torch.no_grad()
 
 from typing import List, Tuple
 
@@ -84,7 +88,8 @@ def thread_receive_video(
         shift_x  = bytes_to_int32(receive_data(socket_rx))
         shift_y  = bytes_to_int32(receive_data(socket_rx))
         blk_size = bytes_to_int32(receive_data(socket_rx))
-        affine_mat = bytes_to_ndarray(receive_data(socket_rx))
+        raw_affine = receive_data(socket_rx)
+        affine_mat = bytes_to_ndarray(raw_affine) if raw_affine else None
 
         # ── anchor_image_padded 복원 ─────────────────────────────
         if compress == "none":
@@ -132,7 +137,7 @@ def thread_process_video(
     frame_queue: Queue, 
     result_queue: Queue,
     queue_proc_timestamp: Queue,
-    device: str='cuda',
+    device: str='cuda:1',
 ) -> float:
     """
     Thread function to process video frames received from the client and send results back.
@@ -142,19 +147,21 @@ def thread_process_video(
         socket_tx (socket.socket): The socket object to send data to.
     """
     import torch
-    from models import MaskedRCNN_ViT_B_FPN_Contexted
+    from models import MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted
     from models import DINO_4Scale_Swin_Contexted
 
-    model = MaskedRCNN_ViT_B_FPN_Contexted(device=device)
+    # model = MaskedRCNN_ViT_L_FPN_Contexted(device=device)
+    model = MaskedRCNN_ViT_H_FPN_Contexted(device=device)
     # model = DINO_4Scale_Swin_Contexted(device=device)
-    model.load_weight("models/model_final_61ccd1.pkl")
+    # model.load_weight("weights/model_final_6146ed.pkl")   # for ViT-L
+    model.load_weight("weights/model_final_7224f1.pkl") # for ViT-H
     model.eval()
     print('Model loaded and ready to process frames.')
 
     num_warmup = 10
     for _ in range(num_warmup):
         dummy_input = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        model.forward_contexted(dummy_input)
+        model.forward_contexted(dummy_input, dirtiness_map=torch.ones(1, 64, 64, 1).to(device))
 
     transmit_data(socket_tx, b"start!")
 
@@ -168,13 +175,16 @@ def thread_process_video(
 
     num_frames = 0
 
+    prev_dmap = None
+
     while True:
         # Fetch frame
         fidx, refresh, target_ndarray, dirtiness_map, (shift_x, shift_y), block_size, affine_mat = frame_queue.get()
         if fidx == -1:
             break
 
-        dirtiness_map = torch.from_numpy(dirtiness_map).to(device)
+        dirtiness_map_now = torch.from_numpy(dirtiness_map).to(device)
+        dirtiness_map = ((dirtiness_map_now + prev_dmap) > 0).float() if prev_dmap is not None else dirtiness_map_now
 
         if anchor_features is not None and shift_x == 0 and shift_y == 0:
             # Shift anchor features if needed
@@ -187,18 +197,19 @@ def thread_process_video(
             target_padded_ndarray = get_padded_image(
                 target_ndarray, input_size, filling_color=PAD_FILLING_COLOR
             )
-            (boxes, labels, scores), cached_features_dict = model.forward_contexted(
-                target_padded_ndarray
+            dirtiness_map = torch.ones(1, 64, 64, 1, device=device)
+            (boxes, labels, scores), cached_features_dict, _ = model.forward_contexted(
+                target_padded_ndarray, dirtiness_map=dirtiness_map
             )
-            dirtiness_map = torch.ones(1, 64, 64, 1)
         else:
-            (boxes, labels, scores), cached_features_dict = model.forward_contexted(
+            (boxes, labels, scores), cached_features_dict, _ = model.forward_contexted(
                 target_ndarray,
                 anchor_features=anchor_features,
                 dirtiness_map=dirtiness_map,
             )
         
         anchor_features = cached_features_dict
+        prev_dmap = dirtiness_map_now if not refresh else None
 
         # Threshold the results
         result_thres = 0.5
@@ -253,11 +264,11 @@ def thread_send_result(
         # Receive results from the processing thread
         fidx, target_ndarray, dirtiness_map, boxes, \
             scores, labels, (shift_x, shift_y), block_size, affine_mat = result_queue.get()
-
-        bboxes_gt = list_annotations[fidx] if fidx < len(list_annotations) else None
         
         if fidx == -1:
             break
+
+        bboxes_gt = list_annotations[fidx] if fidx < len(list_annotations) else None
 
         # Send results back to the client
         transmit_data(socket_tx, fidx.to_bytes(4, 'big'))
@@ -306,7 +317,7 @@ def thread_send_result(
             boxes,
             labels
         )
-        avg_ious.append(avg_iou)
+        avg_ious.append(np.mean(avg_iou) if len(avg_iou) > 0 else 0)
 
         # shift the target_ndarray by the shift_x, shift_y
         if shift_x is not None and shift_y is not None:
@@ -322,7 +333,8 @@ def thread_send_result(
 
     transmit_data(socket_tx, b"", HEADER_TERMINATE)  # Send termination signal
 
-    print(f"Average IoU: {np.mean(avg_ious):.4f}")
+    if annotations is not None:
+        print(f"Average IoU: {np.mean(avg_ious):.4f}")
 
 
 def main(args):
@@ -354,11 +366,11 @@ def main(args):
     # print(f"Received metadata: {metadata}")
 
     # Prepare processes
-    frame_queue = Queue(maxsize=100)
-    result_queue = Queue(maxsize=100)
+    frame_queue = Queue(maxsize=10000)
+    result_queue = Queue(maxsize=10000)
 
-    queue_recv_timestamp = Queue(maxsize=100)
-    queue_proc_timestamp = Queue(maxsize=100)
+    queue_recv_timestamp = Queue(maxsize=10000)
+    queue_proc_timestamp = Queue(maxsize=10000)
 
     thread_recv = Process(
         target=thread_receive_video, 
@@ -459,7 +471,7 @@ def main(args):
     socket_tx.close()
 
     # Create inferenced video using ffmpeg
-    os.system("ffmpeg -framerate 30 -i inferenced/%05d.jpg -c:v libx264 -pix_fmt yuv420p -an -y inferenced.mp4 2> /dev/null")
+    os.system("ffmpeg -framerate 30 -i inferenced/%05d.jpg -c:v libx264 -pix_fmt yuv420p -an -y inferenced.mp4")
     os.system("rm -rf inferenced")  # Clean up images
 
 
@@ -467,9 +479,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Server for processing video frames.")
-    parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
+    parser.add_argument("--server-ip", type=str, default="147.46.128.60", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to run the model on (cpu or cuda).")
+    parser.add_argument("--device", type=str, default="cuda:1", help="Device to run the model on (cpu or cuda).")
 
     args = parser.parse_args()
 

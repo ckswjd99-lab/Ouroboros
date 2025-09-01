@@ -3,13 +3,20 @@ import math
 import torch
 import torch.nn as nn
 
+from ...eventful_transformer.base import ExtendedModule, numeric_tuple
+from ...eventful_transformer.counting import CountedAdd, CountedLinear, CountedMatmul, MlpWithCountedLinear
+from ...eventful_transformer.utils import (
+    DropPath,
+    RelativePositionEmbedding,
+    expand_row_index,
+)
 from ...layers import CNNBlockBase, Conv2d, get_norm
 from .fpn import _assert_strides_are_log2_contiguous
 
 from .backbone import Backbone
 from .utils import (
     PatchEmbed,
-    add_decomposed_rel_pos,
+    AddDecomposedRelPos,
     get_abs_pos,
     window_partition,
     window_unpartition,
@@ -21,7 +28,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["ViT", "SimpleFeaturePyramid", "get_vit_lr_decay_rate"]
 
 
-class Attention(nn.Module):
+class Attention(ExtendedModule):
     """Multi-head Attention block with relative position embeddings."""
 
     def __init__(
@@ -48,9 +55,10 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
+        self.qkv = CountedLinear(in_features=dim, out_features=dim * 3)
+        self.proj = CountedLinear(in_features=dim, out_features=dim)
+        self.matmul = CountedMatmul()
+        self.rel_pos_module = AddDecomposedRelPos()
         self.use_rel_pos = use_rel_pos
         if self.use_rel_pos:
             # initialize relative positional embeddings
@@ -68,13 +76,13 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
+        attn = self.matmul((q * self.scale), k.transpose(-2, -1))
 
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            attn = self.rel_pos_module(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
 
         attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = self.matmul(attn, v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
@@ -141,7 +149,7 @@ class ResBottleneckBlock(CNNBlockBase):
         return out
 
 
-class Block(nn.Module):
+class Block(ExtendedModule):
     """Transformer blocks with support of window attention and residual propagation blocks"""
 
     def __init__(
@@ -187,11 +195,10 @@ class Block(nn.Module):
             input_size=input_size if window_size == 0 else (window_size, window_size),
         )
 
-        from .from_timm import DropPath, Mlp
-
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
+        self.mlp = MlpWithCountedLinear(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
+        self.add = CountedAdd()
 
         self.window_size = window_size
 
@@ -219,8 +226,8 @@ class Block(nn.Module):
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = self.add(shortcut, self.drop_path(x))
+        x = self.add(x, self.drop_path(self.mlp(self.norm2(x))))
 
         if self.use_residual_block:
             x = self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)

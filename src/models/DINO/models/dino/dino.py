@@ -36,7 +36,7 @@ from .utils import sigmoid_focal_loss, MLP
 from ..registry import MODULE_BUILD_FUNCS
 from .dn_components import prepare_for_cdn,dn_post_process
 
-from typing import Dict, Tuple
+from typing import Dict
 from .deformable_transformer import DeformableTransformer
 
 class DINO(nn.Module):
@@ -367,7 +367,9 @@ class DINO(nn.Module):
             features.append(x)
             # position encoding
             poss.append(self.backbone[1](x).to(x.tensors.dtype))
-
+        
+        # before here, 178 ms (100%), 114 ms (23%)
+        # after here, 57 ms (100%), 32 ms (23%)
 
         srcs = []
         masks = []
@@ -399,7 +401,13 @@ class DINO(nn.Module):
             assert targets is None
             input_query_bbox = input_query_label = attn_mask = dn_meta = None
 
-        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs, masks, input_query_bbox, poss,input_query_label,attn_mask)
+        (hs, reference, hs_enc, ref_enc, init_box_proposal), new_cache_features = self.transformer.forward_contexted(
+            srcs, masks, input_query_bbox, poss, input_query_label, attn_mask,
+            cache_prefix=f"{cache_prefix}.transformer",
+            anchor_features=anchor_features,
+            new_cache_features=new_cache_features,
+            dirtiness_map=dirtiness_map,
+        )
         # In case num object=0
         hs[0] += self.label_enc.weight[0,0]*0.0
 
@@ -451,7 +459,9 @@ class DINO(nn.Module):
 
         out['dn_meta'] = dn_meta
 
+        self.out_cache = out
         return out, new_cache_features
+    out_cache = None
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):

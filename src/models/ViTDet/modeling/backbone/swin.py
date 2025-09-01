@@ -20,10 +20,18 @@ import torch.utils.checkpoint as checkpoint
 
 from .backbone import Backbone
 
+from ...eventful_transformer.base import ExtendedModule
+from ...eventful_transformer.counting import CountedAdd, CountedLinear, CountedMatmul, MlpWithCountedLinear
+from ...eventful_transformer.utils import (
+    DropPath,
+    RelativePositionEmbedding,
+    expand_row_index,
+)
+
 _to_2tuple = nn.modules.utils._ntuple(2)
 
 
-class Mlp(nn.Module):
+class Mlp(ExtendedModule):
     """Multilayer perceptron."""
 
     def __init__(
@@ -76,7 +84,7 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
-class WindowAttention(nn.Module):
+class WindowAttention(ExtendedModule):
     """Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
     Args:
@@ -126,9 +134,9 @@ class WindowAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = CountedLinear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = CountedLinear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
@@ -177,7 +185,7 @@ class WindowAttention(nn.Module):
         return x
 
 
-class SwinTransformerBlock(nn.Module):
+class SwinTransformerBlock(ExtendedModule):
     """Swin Transformer Block.
     Args:
         dim (int): Number of input channels.
@@ -234,7 +242,7 @@ class SwinTransformerBlock(nn.Module):
             self.drop_path = nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
+        self.mlp = MlpWithCountedLinear(
             in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop
         )
 
@@ -304,7 +312,7 @@ class SwinTransformerBlock(nn.Module):
         return x
 
 
-class PatchMerging(nn.Module):
+class PatchMerging(ExtendedModule):
     """Patch Merging Layer
     Args:
         dim (int): Number of input channels.
@@ -346,7 +354,7 @@ class PatchMerging(nn.Module):
         return x
 
 
-class BasicLayer(nn.Module):
+class BasicLayer(ExtendedModule):
     """A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of feature channels
@@ -463,7 +471,7 @@ class BasicLayer(nn.Module):
             return x, H, W, x, H, W
 
 
-class PatchEmbed(nn.Module):
+class PatchEmbed(ExtendedModule):
     """Image to Patch Embedding
     Args:
         patch_size (int): Patch token size. Default: 4.

@@ -38,6 +38,7 @@ def connect_dual_tcp(
         # Create server sockets
         server_sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in ports]
         for server_socket, port in zip(server_sockets, ports):
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((host, port))
             server_socket.listen(1)
             print(f"Server listening on {host}:{port}")

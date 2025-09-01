@@ -17,10 +17,13 @@ from typing import Optional
 
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 
 from ...util.misc import inverse_sigmoid
 from .utils import gen_encoder_output_proposals, MLP,_get_activation_fn, gen_sineembed_for_position
 from .ops.modules import MSDeformAttn
+
+from typing import Dict
 
 class DeformableTransformer(nn.Module):
 
@@ -431,6 +434,196 @@ class DeformableTransformer(nn.Module):
         # ref_enc: sigmoid coordinates. \
         #           (n_enc+1, bs, nq, query_dim) or (1, bs, nq, query_dim) or None
 
+    def forward_contexted(
+        self, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None,
+        cache_prefix: str = "",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
+        only_backbone: bool = False,
+    ):
+        """
+        Input:
+            - srcs: List of multi features [bs, ci, hi, wi]
+            - masks: List of multi masks [bs, hi, wi]
+            - refpoint_embed: [bs, num_dn, 4]. None in infer
+            - pos_embeds: List of multi pos embeds [bs, ci, hi, wi]
+            - tgt: [bs, num_dn, d_model]. None in infer
+            
+        """
+        # prepare input for encoder
+        src_flatten = []
+        mask_flatten = []
+        lvl_pos_embed_flatten = []
+        spatial_shapes = []
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
+            bs, c, h, w = src.shape
+            spatial_shape = (h, w)
+            spatial_shapes.append(spatial_shape)
+
+            src = src.flatten(2).transpose(1, 2)                # bs, hw, c
+            mask = mask.flatten(1)                              # bs, hw
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)    # bs, hw, c
+            if self.num_feature_levels > 1 and self.level_embed is not None:
+                lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+            else:
+                lvl_pos_embed = pos_embed
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
+            src_flatten.append(src)
+            mask_flatten.append(mask)
+        src_flatten = torch.cat(src_flatten, 1)    # bs, \sum{hxw}, c 
+        mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c 
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+
+        # two stage
+        enc_topk_proposals = enc_refpoint_embed = None
+
+        #########################################################
+        # Begin Encoder
+        #########################################################
+        (memory, enc_intermediate_output, enc_intermediate_refpoints), new_cache_features = self.encoder.forward_contexted(
+                src_flatten, 
+                pos=lvl_pos_embed_flatten, 
+                level_start_index=level_start_index, 
+                spatial_shapes=spatial_shapes,
+                valid_ratios=valid_ratios,
+                key_padding_mask=mask_flatten,
+                ref_token_index=enc_topk_proposals, # bs, nq 
+                ref_token_coord=enc_refpoint_embed, # bs, nq, 4
+
+                cache_prefix=f"{cache_prefix}.encoder",
+                anchor_features=anchor_features,
+                new_cache_features=new_cache_features,
+                dirtiness_map=dirtiness_map,
+                )
+        # memory = torch.randn((1, 21760, 256), device="cuda") # for debug
+        #########################################################
+        # End Encoder
+        # - memory: bs, \sum{hw}, c
+        # - mask_flatten: bs, \sum{hw}
+        # - lvl_pos_embed_flatten: bs, \sum{hw}, c
+        # - enc_intermediate_output: None or (nenc+1, bs, nq, c) or (nenc, bs, nq, c)
+        # - enc_intermediate_refpoints: None or (nenc+1, bs, nq, c) or (nenc, bs, nq, c)
+        #########################################################
+
+        if self.two_stage_type =='standard':
+            if self.two_stage_learn_wh:
+                input_hw = self.two_stage_wh_embedding.weight[0]
+            else:
+                input_hw = None
+            output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes, input_hw)
+            output_memory = self.enc_output_norm(self.enc_output(output_memory))
+            
+            if self.two_stage_pat_embed > 0:
+                bs, nhw, _ = output_memory.shape
+                # output_memory: bs, n, 256; self.pat_embed_for_2stage: k, 256
+                output_memory = output_memory.repeat(1, self.two_stage_pat_embed, 1)
+                _pats = self.pat_embed_for_2stage.repeat_interleave(nhw, 0) 
+                output_memory = output_memory + _pats
+                output_proposals = output_proposals.repeat(1, self.two_stage_pat_embed, 1)
+
+            if self.two_stage_add_query_num > 0:
+                assert refpoint_embed is not None
+                output_memory = torch.cat((output_memory, tgt), dim=1)
+                output_proposals = torch.cat((output_proposals, refpoint_embed), dim=1)
+
+            enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
+            enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
+            topk = self.num_queries
+            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # bs, nq
+
+            # gather boxes
+            refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)) # unsigmoid
+            refpoint_embed_ = refpoint_embed_undetach.detach()
+            init_box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid() # sigmoid
+
+            # gather tgt
+            tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+            if self.embed_init_tgt:
+                tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+            else:
+                tgt_ = tgt_undetach.detach()
+
+            if refpoint_embed is not None:
+                refpoint_embed=torch.cat([refpoint_embed,refpoint_embed_],dim=1)
+                tgt=torch.cat([tgt,tgt_],dim=1)
+            else:
+                refpoint_embed,tgt=refpoint_embed_,tgt_
+
+        elif self.two_stage_type == 'no':
+            tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+            refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, 4
+
+            if refpoint_embed is not None:
+                refpoint_embed=torch.cat([refpoint_embed,refpoint_embed_],dim=1)
+                tgt=torch.cat([tgt,tgt_],dim=1)
+            else:
+                refpoint_embed,tgt=refpoint_embed_,tgt_
+
+            if self.num_patterns > 0:
+                tgt_embed = tgt.repeat(1, self.num_patterns, 1)
+                refpoint_embed = refpoint_embed.repeat(1, self.num_patterns, 1)
+                tgt_pat = self.patterns.weight[None, :, :].repeat_interleave(self.num_queries, 1) # 1, n_q*n_pat, d_model
+                tgt = tgt_embed + tgt_pat
+
+            init_box_proposal = refpoint_embed_.sigmoid()
+
+        else:
+            raise NotImplementedError("unknown two_stage_type {}".format(self.two_stage_type))
+        #########################################################
+        # End preparing tgt
+        # - tgt: bs, NQ, d_model
+        # - refpoint_embed(unsigmoid): bs, NQ, d_model 
+        ######################################################### 
+
+        #########################################################
+        # Begin Decoder
+        #########################################################
+        hs, references = self.decoder(
+                tgt=tgt.transpose(0, 1), 
+                memory=memory.transpose(0, 1), 
+                memory_key_padding_mask=mask_flatten, 
+                pos=lvl_pos_embed_flatten.transpose(0, 1),
+                refpoints_unsigmoid=refpoint_embed.transpose(0, 1), 
+                level_start_index=level_start_index, 
+                spatial_shapes=spatial_shapes,
+                valid_ratios=valid_ratios,tgt_mask=attn_mask)
+        #########################################################
+        # End Decoder
+        # hs: n_dec, bs, nq, d_model
+        # references: n_dec+1, bs, nq, query_dim
+        #########################################################
+
+        #########################################################
+        # Begin postprocess
+        #########################################################     
+        if self.two_stage_type == 'standard':
+            if self.two_stage_keep_all_tokens:
+                hs_enc = output_memory.unsqueeze(0)
+                ref_enc = enc_outputs_coord_unselected.unsqueeze(0)
+                init_box_proposal = output_proposals
+
+            else:
+                hs_enc = tgt_undetach.unsqueeze(0)
+                ref_enc = refpoint_embed_undetach.sigmoid().unsqueeze(0)
+        else:
+            hs_enc = ref_enc = None
+        #########################################################
+        # End postprocess
+        # hs_enc: (n_enc+1, bs, nq, d_model) or (1, bs, nq, d_model) or (n_enc, bs, nq, d_model) or None
+        # ref_enc: (n_enc+1, bs, nq, query_dim) or (1, bs, nq, query_dim) or (n_enc, bs, nq, d_model) or None
+        #########################################################        
+
+        return (hs, references, hs_enc, ref_enc, init_box_proposal), new_cache_features
+        # hs: (n_dec, bs, nq, d_model)
+        # references: sigmoid coordinates. (n_dec+1, bs, bq, 4)
+        # hs_enc: (n_enc+1, bs, nq, d_model) or (1, bs, nq, d_model) or None
+        # ref_enc: sigmoid coordinates. \
+        #           (n_enc+1, bs, nq, query_dim) or (1, bs, nq, query_dim) or None
+
 
 class TransformerEncoder(nn.Module):
 
@@ -576,6 +769,118 @@ class TransformerEncoder(nn.Module):
             intermediate_output = intermediate_ref = None
 
         return output, intermediate_output, intermediate_ref
+    
+    def forward_contexted(self, 
+            src: Tensor, 
+            pos: Tensor, 
+            spatial_shapes: Tensor, 
+            level_start_index: Tensor, 
+            valid_ratios: Tensor, 
+            key_padding_mask: Tensor,
+            ref_token_index: Optional[Tensor]=None,
+            ref_token_coord: Optional[Tensor]=None,
+
+            cache_prefix: str = "",
+            anchor_features: Dict[str, torch.Tensor] = {},
+            new_cache_features: Dict[str, torch.Tensor] = {},
+            dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda"),
+            ):
+        """
+        Input:
+            - src: [bs, sum(hi*wi), 256]
+            - pos: pos embed for src. [bs, sum(hi*wi), 256]
+            - spatial_shapes: h,w of each level [num_level, 2]
+            - level_start_index: [num_level] start point of level in sum(hi*wi).
+            - valid_ratios: [bs, num_level, 2]
+            - key_padding_mask: [bs, sum(hi*wi)]
+
+            - ref_token_index: bs, nq
+            - ref_token_coord: bs, nq, 4
+        Intermedia:
+            - reference_points: [bs, sum(hi*wi), num_level, 2]
+        Outpus: 
+            - output: [bs, sum(hi*wi), 256]
+        """
+        if self.two_stage_type in ['no', 'standard', 'enceachlayer', 'enclayer1']:
+            assert ref_token_index is None
+
+        output = src
+        # preparation and reshape
+        if self.num_layers > 0:
+            if self.deformable_encoder:
+                reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
+
+        intermediate_output = []
+        intermediate_ref = []
+        if ref_token_index is not None:
+            out_i = torch.gather(output, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, self.d_model))
+            intermediate_output.append(out_i)
+            intermediate_ref.append(ref_token_coord)
+
+        # main process
+        for layer_id, layer in enumerate(self.layers):
+            layer: DeformableTransformerEncoderLayer
+            # main process
+            dropflag = False
+            if self.enc_layer_dropout_prob is not None:
+                prob = random.random()
+                if prob < self.enc_layer_dropout_prob[layer_id]:
+                    dropflag = True
+            
+            if not dropflag:
+                if self.deformable_encoder:
+                    output, new_cache_features = layer.forward_contexted(
+                        src=output, pos=pos, reference_points=reference_points, spatial_shapes=spatial_shapes, level_start_index=level_start_index, key_padding_mask=key_padding_mask,
+                        cache_prefix=f"{cache_prefix}.layers.{layer_id}",
+                        anchor_features=anchor_features,
+                        new_cache_features=new_cache_features,
+                        dirtiness_map=dirtiness_map,
+                    )
+                    # output = layer(
+                    #     src=output, pos=pos, reference_points=reference_points, spatial_shapes=spatial_shapes, level_start_index=level_start_index, key_padding_mask=key_padding_mask
+                    # )
+                else:
+                    # output, new_cache_features = layer.forward_contexted(
+                    #     src=output.transpose(0, 1), pos=pos.transpose(0, 1), key_padding_mask=key_padding_mask,
+                    #     cache_prefix=f"{cache_prefix}.layers.{layer_id}",
+                    #     anchor_features=anchor_features,
+                    #     new_cache_features=new_cache_features,
+                    #     dirtiness_map=dirtiness_map,
+                    # ).transpose(0, 1)
+                    output = layer(
+                        src=output.transpose(0, 1), pos=pos.transpose(0, 1), key_padding_mask=key_padding_mask
+                    ).transpose(0, 1)
+
+            if ((layer_id == 0 and self.two_stage_type in ['enceachlayer', 'enclayer1']) \
+                or (self.two_stage_type == 'enceachlayer')) \
+                    and (layer_id != self.num_layers - 1):
+                output_memory, output_proposals = gen_encoder_output_proposals(output, key_padding_mask, spatial_shapes)
+                output_memory = self.enc_norm[layer_id](self.enc_proj[layer_id](output_memory))
+                
+                # gather boxes
+                topk = self.num_queries
+                enc_outputs_class = self.class_embed[layer_id](output_memory)
+                ref_token_index = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1] # bs, nq
+                ref_token_coord = torch.gather(output_proposals, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, 4))
+
+                output = output_memory
+
+            # aux loss
+            if (layer_id != self.num_layers - 1) and ref_token_index is not None:
+                out_i = torch.gather(output, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, self.d_model))
+                intermediate_output.append(out_i)
+                intermediate_ref.append(ref_token_coord)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        if ref_token_index is not None:
+            intermediate_output = torch.stack(intermediate_output) # n_enc/n_enc-1, bs, \sum{hw}, d_model
+            intermediate_ref = torch.stack(intermediate_ref)
+        else:
+            intermediate_output = intermediate_ref = None
+
+        return (output, intermediate_output, intermediate_ref), new_cache_features
 
 class TransformerDecoder(nn.Module):
 
@@ -820,6 +1125,51 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
         return src
 
+    def forward_contexted(
+        self, src, pos, reference_points, spatial_shapes, level_start_index, key_padding_mask=None,
+        cache_prefix: str = "",
+        anchor_features: Dict[str, torch.Tensor] = {},
+        new_cache_features: Dict[str, torch.Tensor] = {},
+        dirtiness_map: torch.Tensor = torch.ones(1, 256, 256, 1, device="cuda")
+    ):
+        # self attention
+        src2 = self.self_attn(
+            self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index, key_padding_mask
+        )   # 10 ms
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+
+        # ffn
+        # expand dirtiness map with (3, 3) kernel
+        mean_kernel = torch.ones(1, 1, device=src.device) / 1.0
+        dirtiness_map = F.conv2d(dirtiness_map.permute(0, 3, 1, 2), mean_kernel[None, None, :, :], padding=1)
+        dirtiness_map = (dirtiness_map > 0).float()
+        # dirtiness_map: (1, 1, 256, 256)
+
+        dmap_256 = F.interpolate(dirtiness_map, size=(256, 256), mode='area').view(-1)
+        dmap_128 = F.interpolate(dirtiness_map, size=(128, 128), mode='area').view(-1)
+        dmap_64 = F.interpolate(dirtiness_map, size=(64, 64), mode='area').view(-1)
+        dmap_32 = F.interpolate(dirtiness_map, size=(32, 32), mode='area').view(-1)
+        dmap_16 = F.interpolate(dirtiness_map, size=(16, 16), mode='area').view(-1)
+
+        if level_start_index.shape[0] == 4:
+            dmap_flatten = torch.cat([dmap_128, dmap_64, dmap_32, dmap_16], dim=0)
+        elif level_start_index.shape[0] == 5:
+            dmap_flatten = torch.cat([dmap_256, dmap_128, dmap_64, dmap_32, dmap_16], dim=0)
+
+        src[:, dmap_flatten > 0, :] = self.forward_ffn(src[:, dmap_flatten > 0, :])
+
+        fname=f"{cache_prefix}.ffn_out"
+        src = anchor_features[fname] * (1 - dmap_flatten[:, None]) + src * dmap_flatten[:, None] \
+            if fname in anchor_features else src
+        new_cache_features[fname] = src
+
+        # channel attn
+        if self.add_channel_attention:
+            src = self.norm_channel(src + self.activ_channel(src))
+
+        return src, new_cache_features
+
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
@@ -975,7 +1325,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 self_attn_mask: Optional[Tensor] = None, # mask used for self-attention
                 cross_attn_mask: Optional[Tensor] = None, # mask used for cross-attention
             ):
-
         for funcname in self.module_seq:
             if funcname == 'ffn':
                 tgt = self.forward_ffn(tgt)

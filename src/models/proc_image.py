@@ -7,7 +7,7 @@ import cv2
 import os
 import matplotlib.pyplot as plt
 
-from typing import Tuple, Dict
+from typing import Tuple, Union, List
 
 from .constants import COCO_COLORS_ARRAY, COCO_LABELS_LIST
 
@@ -48,7 +48,7 @@ def create_compute_block(compute_map: torch.Tensor, block_size: int) -> torch.Te
     return compute_map
 
 
-def shift_by_float(tensor: torch.Tensor, tvec: tuple[float, float]) -> torch.Tensor:
+def shift_by_float(tensor: torch.Tensor, tvec: Tuple[float, float]) -> torch.Tensor:
     B, C, H, W = tensor.shape
     tx, ty = tvec
     
@@ -70,10 +70,10 @@ def shift_by_float(tensor: torch.Tensor, tvec: tuple[float, float]) -> torch.Ten
 
 
 def shift_features_dict(
-    features: Dict[str, torch.Tensor],
+    features: Union[str, torch.Tensor],
     ref_size: Tuple[int, int],
     shift_vector: Tuple[float, float],
-) -> Dict[str, torch.Tensor]:
+) -> Union[str, torch.Tensor]:
     shifted_features = {}
     for fname, feature in features.items():
         if feature is not None:
@@ -89,7 +89,7 @@ def shift_features_dict(
 def refine_images(
     anchor_image_ndarray: np.ndarray,
     target_image_ndarray: np.ndarray,
-) -> Tuple[np.ndarray | None, Tuple[float, float]]:
+) -> Tuple[Union[np.ndarray, None], Tuple[float, float]]:
 
     gray1 = cv2.cvtColor(anchor_image_ndarray, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(target_image_ndarray, cv2.COLOR_BGR2GRAY)
@@ -164,7 +164,7 @@ def visualize_detection(
     scores: np.ndarray,
     threshold: float = 0.9,
     colors: np.ndarray = COCO_COLORS_ARRAY,
-    labels_list: list[str] = COCO_LABELS_LIST,
+    labels_list: List[str] = COCO_LABELS_LIST,
 ) -> np.ndarray:
     for i in range(len(boxes)):
         if scores[i] > threshold:

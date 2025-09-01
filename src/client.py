@@ -31,7 +31,7 @@ from preprocessing import (
     estimate_affine_in_padded_anchor_fast,
     apply_affine_and_pad, get_padded_image,
     create_dirtiness_map,
-    create_dirtiness_map_percentage,
+    # create_dirtiness_map_percentage,
     rigid_from_mvs
 )
 
@@ -145,6 +145,8 @@ def thread_send_video(
                                        [0, 0, 1]], dtype=np.float32)
             refresh |= (target_padded_ndarray is None)
             refresh |= (scaling_factor < 0.95)
+            # print(f"scaling_factor: {scaling_factor:.2f}")
+            refresh |= (scaling_factor > 1.7)
 
         if refresh:
             dirtiness_map = torch.ones(1, 64, 64, 1)
@@ -263,9 +265,9 @@ def main(args):
     print(f"Timelag: {timelag} seconds")
 
     # Create queues for recording
-    queue_preproc_timestamp = Queue(maxsize=100)
-    queue_transmit_timestamp = Queue(maxsize=100)
-    queue_receive_timestamp = Queue(maxsize=100)
+    queue_preproc_timestamp = Queue(maxsize=10000)
+    queue_transmit_timestamp = Queue(maxsize=10000)
+    queue_receive_timestamp = Queue(maxsize=10000)
 
     # Create a semaphore for offloading
     sem_offload = Semaphore(1) if sequential else None
@@ -302,19 +304,23 @@ def main(args):
         except Exception as e:
             print(f"Error loading annotations: {e}")
             annotations = None
+    else:
+        annotations = None
+        print("No annotations provided.")
 
     # Send metadata
     metadata = {
         "gop": gop,
         "compress": compress,
-        "frame_shape": (854, 480)
+        "frame_shape": (854, 480),
+        "video_basename": video_path.split('/')[-1].strip('.mp4'),
     }
     if annotations:
         metadata["annotations"] = annotations
     metadata_bytes = str(metadata).encode('utf-8')
     transmit_data(socket_tx, metadata_bytes)
 
-    print("Sent metadata:", metadata)
+    # print("Sent metadata:", metadata)
 
     # Wait for server to be ready
     receive_data(socket_rx)
@@ -360,11 +366,15 @@ def main(args):
 if __name__ == "__main__":
     import argparse
 
+    DEFAULT_SEQUENCE = "drone"
+
     parser = argparse.ArgumentParser(description="Client for sending video to server.")
     parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--video-path", type=str, default="/data/DAVIS/MP4Videos/480p/bear.mp4", help="Path to the video file.")
-    parser.add_argument("--annotation-path", type=str, default="/data/DAVIS/Annotations_bbox/480p/bear.json", help="Path to the annotation file.")
+    parser.add_argument("--video-path", type=str, default=f"/data/DAVIS2017_trainval/MP4Videos/480p/{DEFAULT_SEQUENCE}.mp4", help="Path to the video file.")
+    # parser.add_argument("--video-path", type=str, default=f"/data/vid_data/vid/vid_val/videos/00005001.mp4", help="Path to the video file.")
+    parser.add_argument("--annotation-path", type=str, default=f"/data/DAVIS2017_trainval/Annotations_bbox/480p/{DEFAULT_SEQUENCE}.json", help="Path to the annotation file.")
+    # parser.add_argument("--annotation-path", type=str, default=None, help="Path to the annotation file.")
     parser.add_argument("--frame-rate", type=float, default=100, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
     parser.add_argument("--compress", type=str, default="h264", help="Compress video frames before sending.")

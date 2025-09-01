@@ -78,6 +78,9 @@ def create_dirtiness_map(
     dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
+    if dirtiness_map.mean() < 0.01:
+        dirtiness_map[0, 0, 0, 0] = 1.0  # Ensure at least one pixel is dirty
+
     # minimum recompute
     # maxnum = 10
     # while dirtiness_map.mean() < 0.01:
@@ -86,45 +89,6 @@ def create_dirtiness_map(
     #     maxnum -= 1
     #     if maxnum == 0:
     #         break
-
-    return dirtiness_map
-
-def create_dirtiness_map_percentage(
-    anchor_image: np.ndarray, 
-    current_image: np.ndarray,
-    block_size: int = 16,
-    dirty_toprate: float = 0.2,
-    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
-    sensi_map: np.ndarray = None,
-) -> torch.Tensor:
-    residual = cv2.absdiff(anchor_image, current_image)
-    
-    # inside current_image, if there is any pixel with chromakey color, set the residual as 0
-    # chromakey_mask = np.all(current_image == chromakey, axis=-1)
-    # residual[chromakey_mask] = 0
-
-    image_H, image_W = residual.shape[:2]
-
-    dirtiness_map = cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
-    dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
-
-    # Calculate the threshold based on the top percentage of dirtiness
-    flat_dirtiness_map = dirtiness_map.flatten()
-    num_blocks = flat_dirtiness_map.size
-    num_dirty_blocks = int(num_blocks * dirty_toprate)
-    if num_dirty_blocks == 0:
-        dirty_thres = 0
-    else:
-        dirty_thres = np.partition(flat_dirtiness_map, -num_dirty_blocks)[-num_dirty_blocks]
-    
-    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
-    if sensi_map is None:
-        dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
-    else:
-        dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
-
-    dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
-    dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
     return dirtiness_map
 
@@ -237,12 +201,23 @@ def pattern_match_in_padded_anchor(
 
     return translation_matrix
 
-def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int):
+def shift_anchor_features(
+        anchor_features: dict, 
+        shift_x: int, 
+        shift_y: int, 
+        ape: torch.Tensor = None,
+        k_pe: Dict[str, torch.Tensor] = None,
+        v_pe: Dict[str, torch.Tensor] = None
+) -> dict:
     """
     anchor_features의 모든 qkv/out 텐서를 shift_x, shift_y만큼 블록 단위로 이동시킴.
     """
     for key, value in anchor_features.items():
-        if "qkv" in key:
+        if "qkv" in key and "qkvpe" not in key:
+            bidx = int(key.split("block")[-1].split("_")[0])
+            x_std = anchor_features.get(f"block{bidx}_std", None).mean()
+            qkvpe = anchor_features.get(f"block{bidx}_qkvpe", None)
+
             num_windows = value.shape[1]
             num_hw = value.shape[3]
 
@@ -252,11 +227,22 @@ def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int):
             key_reshaped = value.view(
                 value.shape[0], sqrt_num_windows, sqrt_num_windows, value.shape[2],
                 sqrt_num_hw, sqrt_num_hw, value.shape[4]
-            )
+            )   # (3, sqrt_num_windows, sqrt_num_windows, num_heads, H, W, C)
             key_reshaped = key_reshaped.permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(
                 value.shape[0], sqrt_num_windows * sqrt_num_hw, sqrt_num_windows * sqrt_num_hw, value.shape[2], value.shape[4]
+            )   # (3, real_H, real_W, num_heads, C)
+
+            pe_reshaped = qkvpe.view(
+                qkvpe.shape[0], sqrt_num_windows, sqrt_num_windows, qkvpe.shape[2],
+                sqrt_num_hw, sqrt_num_hw, qkvpe.shape[4]
+            ).permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(
+                value.shape[0], sqrt_num_windows * sqrt_num_hw, sqrt_num_windows * sqrt_num_hw, value.shape[2], value.shape[4]
             )
+
+            key_reshaped -= pe_reshaped / x_std
             key_reshaped = key_reshaped.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
+            key_reshaped += pe_reshaped / x_std
+
             key_reshaped = key_reshaped.view(
                 value.shape[0], sqrt_num_windows, sqrt_num_hw, sqrt_num_windows, sqrt_num_hw, value.shape[2], value.shape[4]
             )
@@ -265,7 +251,11 @@ def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int):
             anchor_features[key] = key_reshaped
         if "out" in key:
             # value: (B, H, W, C)
+            if ape is not None:
+                value -= ape
             value = value.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
+            if ape is not None:
+                value += ape
             anchor_features[key] = value
     
     return anchor_features
@@ -330,8 +320,13 @@ def get_padded_image(
     image_ndarray: np.ndarray, 
     size: Tuple[int, int], 
     basic_scaling_factor: float = 1.0,
-    filling_color: List[float] = [123.675, 116.28, 103.53]
+    filling_color: List[float] = [0, 0, 0]
 ) -> np.ndarray:
+    
+    longest_side = max(image_ndarray.shape[0], image_ndarray.shape[1])
+    if longest_side > size[0] or longest_side > size[1]:
+        basic_scaling_factor = min(size[0] / longest_side, size[1] / longest_side) * 0.9
+
     image_scaled = cv2.resize(image_ndarray, (int(image_ndarray.shape[1] * basic_scaling_factor), int(image_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
 
     shift_to_center = ((size[1] - image_scaled.shape[1]) // 2, (size[0] - image_scaled.shape[0]) // 2)
