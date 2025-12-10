@@ -3,7 +3,9 @@
 Official repository of
 **Ouroboros: Instilling Motion Awareness in ViTs for Efficient Video Analytics on the Edge**.
 
-![](https://raw.githubusercontent.com/ckswjd99-lab/Ouroboros/refs/heads/main/figure_1.png)
+<p align="center" width="70%">
+  <img src="https://raw.githubusercontent.com/ckswjd99-lab/Ouroboros/refs/heads/main/figure_1.png" alt="SparseSpec Overview" width="70%">
+</p>
 
 ## Abstract
 
