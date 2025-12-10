@@ -45,11 +45,7 @@ def rigid_from_mvs(mvs: np.ndarray):
     src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
     if dst.shape[0] < 3 or src.shape[0] < 3:
         return None
-    M, _ = cv2.estimateAffinePartial2D(dst, src,
-                                       method=cv2.RANSAC,
-                                       ransacReprojThreshold=2.0,
-                                       confidence=0.995,
-                                       refineIters=10)
+    M, _ = cv2.estimateAffine2D(dst, src, method=cv2.LMEDS)
     return M                                                   # shape (2,3) or None
 
 

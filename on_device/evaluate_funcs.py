@@ -237,8 +237,9 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
 
 
 def estimate_affine(prev_nd, curr_nd):
-    MAX_PTS, LK_WIN   = 400, (15, 15)
-    QUALITY, RANSAC_RE = 0.01, 3.0
+    MAX_PTS           = 400
+    LK_WIN            = (15, 15)
+    QUALITY           = 0.01
     DOWNSCALE         = 0.5
 
     prev_g = cv2.resize(cv2.cvtColor(prev_nd, cv2.COLOR_BGR2GRAY), None, fx=DOWNSCALE, fy=DOWNSCALE, interpolation=cv2.INTER_AREA)
@@ -250,11 +251,27 @@ def estimate_affine(prev_nd, curr_nd):
                                          winSize=LK_WIN, maxLevel=3)
     ok = st.squeeze() == 1
     if ok.sum() < 6: return np.eye(2, 3, dtype=np.float32)
-    T, _ = cv2.estimateAffinePartial2D(p1[ok], p0[ok], method=cv2.LMEDS)
+    T, _ = cv2.estimateAffine2D(p1[ok], p0[ok], method=cv2.LMEDS)
 
     T[0,2] /= DOWNSCALE;  T[1,2] /= DOWNSCALE
     
     return T.astype(np.float32) if T is not None else None
+
+
+def rigid_from_mvs(mvs: np.ndarray):
+    """
+    모션벡터(N, 5) → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
+    실패 시 None 반환.
+    """
+    if mvs is None or mvs.shape[0] < 3 or mvs.shape[1] != 5:
+        return None
+    # mvs: [dst_x, dst_y, motion_x, motion_y, motion_scale]
+    dst = mvs[:, 0:2].astype(np.float32)
+    src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
+    if dst.shape[0] < 3 or src.shape[0] < 3:
+        return None
+    M, _ = cv2.estimateAffine2D(dst, src, method=cv2.LMEDS)
+    return M                                                   # shape (2,3) or None
 
 
 def refresh_placing_matrix(placing_matrix, img_H, img_W, input_img_size, block_size):

@@ -110,8 +110,7 @@ def refine_images(
         if good_old.shape[0] < 3:
             return None, (0, 0)
 
-        # Outlier removal using RANSAC
-        matrix, inliers = cv2.estimateAffinePartial2D(good_old, good_new, method=cv2.RANSAC, ransacReprojThreshold=3)
+        matrix, inliers = cv2.estimateAffine2D(good_old, good_new, method=cv2.LMEDS)
         inlier_old = good_old[inliers.flatten() == 1]
         inlier_new = good_new[inliers.flatten() == 1]
 

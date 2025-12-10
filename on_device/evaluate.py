@@ -24,6 +24,7 @@ from davis.davis2017.metrics import db_eval_iou, db_eval_boundary
 from evaluate_funcs import (
     prepare_environment,
     estimate_affine,
+    rigid_from_mvs,
     refresh_placing_matrix,
     shift_anchor_features,
     shift_anchor_features_swin,
@@ -34,6 +35,8 @@ from evaluate_funcs import (
 )
 from ipconv.models.ViTDet.eventful_transformer.base import dict_string
 from ipconv.models.ViTDet.modeling.backbone.utils import get_abs_pos
+
+X265_PARAMS="preset=ultrafast:tune=zerolatency:keyint=9999:min-keyint=9999:bframes=0"
 
 J_list = []
 F_list = []
@@ -54,6 +57,8 @@ def evaluate_sequence(
     """
     Evaluate the model on a single sequence of images.
     """
+    custom_h265.mv_init(1024, 1024, int(frame_rate), X265_PARAMS)
+
     def safe_tensor(array, shape, dtype):
         if array.size > 0:
             return torch.from_numpy(array).reshape(shape).type(dtype)
@@ -143,7 +148,9 @@ def evaluate_sequence(
         # > frame drift out
         shift_x, shift_y = 0, 0
         if not refresh:
-            affine_matrix = estimate_affine(ref_frame, image)
+            _, mvs = custom_h265.mv_process_and_encode(image)
+            affine_matrix = rigid_from_mvs(mvs)
+
             placing_matrix = placing_matrix @ np.vstack([affine_matrix, [0, 0, 1]])
 
             refresh_pmat, placing_matrix, (shift_x, shift_y) = refresh_placing_matrix(
@@ -384,6 +391,8 @@ def evaluate_sequence(
             F_list.append(f)
         
         recomp_rate_list.append(dmap_recompute.mean().item())
+
+    custom_h265.mv_close()
 
 
 def evaluate(

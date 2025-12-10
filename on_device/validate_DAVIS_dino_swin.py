@@ -124,8 +124,7 @@ def estimate_affine_in_padded_anchor(
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
     # Calculate Affine Transform
-    # affine_matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=3.0)
-    affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.LMEDS, maxIters=5000, confidence=0.999, refineIters=10)
+    affine_matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, cv2.LMEDS)
 
     return affine_matrix
 

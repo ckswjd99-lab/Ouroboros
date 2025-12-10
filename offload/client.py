@@ -25,7 +25,7 @@ from networking import (
 from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 from custom_h264 import custom_h264
-
+from custom_h265 import custom_h265
 
 def rigid_from_mvs(mvs: np.ndarray):
     """
@@ -39,11 +39,7 @@ def rigid_from_mvs(mvs: np.ndarray):
     src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
     if dst.shape[0] < 3 or src.shape[0] < 3:
         return None
-    M, _ = cv2.estimateAffinePartial2D(dst, src,
-                                       method=cv2.RANSAC,
-                                       ransacReprojThreshold=2.0,
-                                       confidence=0.995,
-                                       refineIters=10)
+    M, _ = cv2.estimateAffine2D(dst, src, method=cv2.LMEDS)
     return M                                                   # shape (2,3) or None
 
 
@@ -70,8 +66,8 @@ def thread_send_video(
     WIDTH, HEIGHT = frames[0].shape[1], frames[0].shape[0]
 
     if compress == "h264":
-        X264_PARAMS = "keyint=9999:min-keyint=9999:no-scenecut=1:bframes=0:ref=1:deadzone-inter=1000:deadzone-intra=300:aq-mode=0:psy-rd=0.0:mbtree=0:rc-lookahead=0:qpstep=10"
-        custom_h264.mv_init(WIDTH, HEIGHT, int(frame_rate), X264_PARAMS)
+        X265_PARAMS="preset=ultrafast:tune=zerolatency:keyint=9999:min-keyint=9999:bframes=0"
+        custom_h265.mv_init(WIDTH, HEIGHT, int(frame_rate), X265_PARAMS)
 
     for fidx, frame in enumerate(frames):
         if sem_offload is not None:
@@ -93,7 +89,7 @@ def thread_send_video(
         
         elif compress == "h264":
             # mv_lib로 인코딩 및 모션벡터 추출
-            encoded_bytes, mvs = custom_h264.mv_process_and_encode(frame)
+            encoded_bytes, mvs = custom_h265.mv_process_and_encode(frame)
             # 인코딩 바이트 전송 (길이 포함)
             transmit_data(socket_tx, encoded_bytes)
             # 모션벡터 전송
@@ -113,7 +109,7 @@ def thread_send_video(
         queue_timestamp.put(timestamp)
 
     if compress == "h264":
-        custom_h264.mv_close()
+        custom_h265.mv_close()
 
     # Send termination signal
     transmit_data(socket_tx, b"", HEADER_TERMINATE)
