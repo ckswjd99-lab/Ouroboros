@@ -181,3 +181,6 @@ logs
 *.jpg
 *.pth
 *.pkl
+
+*/output
+*.out
